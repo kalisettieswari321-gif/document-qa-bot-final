@@ -4,35 +4,47 @@ ChromaDB, build a strictly-grounded prompt, and ask Gemini to answer.
 """
 
 import os
-import google.generativeai as genai
 from dotenv import load_dotenv
+from google import genai
 
 from . import config
 from .vector_store import get_collection
 
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
+
+
+def get_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("GEMINI_API_KEY not found")
+    return genai.Client(api_key=api_key)
+
 
 SYSTEM_PROMPT = (
     "You are a professional, accurate document Q&A assistant. "
     "Answer the user's question using ONLY the provided document context below. "
-    "Cite the sources (filenames and pages) inline next to facts you mention, "
-    "e.g. (report.pdf, Page 4). "
-    "If the answer cannot be found in the context, clearly state: "
-    "'I am sorry, but the provided documents do not contain the answer to your question.' "
-    "Do not make up facts or use external knowledge."
+    "Cite the sources (filenames and pages) inline next to facts you mention. "
+    "If the answer cannot be found in the context, clearly state that the "
+    "documents do not contain the answer."
 )
 
 
-def query_rag_pipeline(user_query: str, db_path: str = config.DB_DIR, k: int = config.TOP_K) -> dict:
-    """Search the database, build a grounded prompt, and query the LLM."""
-    if not API_KEY:
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))  # pick up keys set after import (e.g. Streamlit)
+def query_rag_pipeline(
+    user_query: str,
+    db_path: str = config.DB_DIR,
+    k: int = config.TOP_K,
+) -> dict:
 
-    collection = get_collection(db_path=db_path)
-    results = collection.query(query_texts=[user_query], n_results=k)
+    collection = get_collection(
+        db_path=db_path,
+        create=False,
+        for_query=True,
+    )
+
+    results = collection.query(
+        query_texts=[user_query],
+        n_results=k,
+    )
 
     documents = results.get("documents", [[]])[0]
     metadatas = results.get("metadatas", [[]])[0]
@@ -43,9 +55,14 @@ def query_rag_pipeline(user_query: str, db_path: str = config.DB_DIR, k: int = c
     for doc, meta in zip(documents, metadatas):
         source_name = meta.get("source", "unknown")
         page_num = meta.get("page", "N/A")
-        citation_str = f"Source: {source_name}, Page: {page_num}"
-        context_blocks.append(f"[{citation_str}]\nContext: {doc}")
-        citations.append(citation_str)
+
+        citation = f"{source_name} Page {page_num}"
+
+        context_blocks.append(
+            f"[{citation}]\n{doc}"
+        )
+
+        citations.append(citation)
 
     if not context_blocks:
         return {
@@ -56,18 +73,29 @@ def query_rag_pipeline(user_query: str, db_path: str = config.DB_DIR, k: int = c
 
     context_payload = "\n\n---\n\n".join(context_blocks)
 
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"CONTEXT INFORMATION:\n{context_payload}\n\n"
-        f"USER QUESTION: {user_query}\n\n"
-        f"GROUNDED ANSWER:"
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+CONTEXT:
+{context_payload}
+
+QUESTION:
+{user_query}
+
+ANSWER:
+"""
+
+    client = get_client()
+
+    response = client.models.generate_content(
+        model=config.GENERATION_MODEL,
+        contents=prompt,
     )
 
-    model = genai.GenerativeModel(config.GENERATION_MODEL)
-    response = model.generate_content(prompt)
+    answer = response.text if hasattr(response, "text") else str(response)
 
     return {
-        "answer": response.text,
+        "answer": answer,
         "citations": citations,
         "raw_context": documents,
     }
